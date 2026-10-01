@@ -7,6 +7,10 @@
 # Config
 claude_desktop_config.json
 
+# Personal calendar-assistant project config (your own calendars/chats/email/
+# Slack) — commit whatsapp-notifier-projects.example.json instead, never this.
+whatsapp-notifier-projects.json
+
 # Claude Code local settings (per-user)
 .claude/settings.local.json
 

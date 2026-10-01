@@ -1,0 +1,173 @@
+#!/bin/zsh
+set -euo pipefail
+
+source "$HOME/Library/Application Support/whatsapp-mcp/calendar-assistant.env"
+
+STATE_DIR="${WHATSAPP_MCP_STATE_DIR:-$HOME/Library/Application Support/whatsapp-mcp/state}"
+LOG_DIR="${WHATSAPP_MCP_LOG_DIR:-$HOME/Library/Logs/whatsapp-mcp}"
+STATE_FILE="$STATE_DIR/last-calendar-assistant-check"
+ERR_LOG="$LOG_DIR/calendar-assistant.err.log"
+
+mkdir -p "$STATE_DIR"
+
+notify() {
+  local title="$1"
+  local msg="$2"
+  if [[ -n "$WHATSAPP_NOTIFIER_TERMINAL_NOTIFIER_BIN" ]]; then
+    "$WHATSAPP_NOTIFIER_TERMINAL_NOTIFIER_BIN" -title "$title" -message "$msg" >>"$ERR_LOG" 2>&1 || true
+  else
+    osascript \
+      -e 'on run argv' \
+      -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+      -e 'end run' \
+      "$title" "$msg" >>"$ERR_LOG" 2>&1 || true
+  fi
+}
+
+CONFIG="$WHATSAPP_NOTIFIER_CONFIG"
+if ! jq empty "$CONFIG" 2>>"$ERR_LOG"; then
+  print -r -- "$(date -u +"%Y-%m-%d %H:%M:%S") config at $CONFIG is not valid JSON; skipping this run." >> "$ERR_LOG"
+  exit 0
+fi
+
+if [[ ! -f "$STATE_FILE" ]]; then
+  date -u -v-${WHATSAPP_NOTIFIER_LOOKBACK_MINUTES}M +"%Y-%m-%d %H:%M:%S" > "$STATE_FILE"
+fi
+LAST_CHECK="$(cat "$STATE_FILE")"
+NOW="$(date -u +"%Y-%m-%d %H:%M:%S")"
+TODAY="$(date +%Y%m%d)"
+
+build_in_list() {
+  local raw="$1"
+  local out=""
+  local jid
+  IFS=',' read -rA jids <<< "$raw"
+  for jid in "${jids[@]}"; do
+    jid="${jid//[[:space:]]/}"
+    [[ -n "$jid" ]] || continue
+    jid="${jid//\'/\'\'}"
+    if [[ -n "$out" ]]; then out="$out,"; fi
+    out="$out'$jid'"
+  done
+  print -r -- "$out"
+}
+
+sql_escape() {
+  print -r -- "${1//\'/\'\'}"
+}
+
+PROJECT_COUNT="$(jq '.projects | length' "$CONFIG")"
+CASE_SQL=""
+WHERE_PARTS=()
+PROJECT_DESCRIPTIONS=""
+for (( i = 0; i < PROJECT_COUNT; i++ )); do
+  TAG="$(jq -r ".projects[$i].tag" "$CONFIG")"
+  CAL="$(jq -r ".projects[$i].calendarId" "$CONFIG")"
+  DESC="$(jq -r ".projects[$i].description // \"\"" "$CONFIG")"
+  CHATS_CSV="$(jq -r ".projects[$i].chats | join(\",\")" "$CONFIG")"
+  IN_LIST="$(build_in_list "$CHATS_CSV")"
+  [[ -n "$IN_LIST" ]] || continue
+  TAG_SQL="$(sql_escape "$TAG")"
+  CASE_SQL="$CASE_SQL WHEN messages.chat_jid IN ($IN_LIST) THEN '$TAG_SQL'"
+  WHERE_PARTS+=("messages.chat_jid IN ($IN_LIST)")
+  PROJECT_DESCRIPTIONS="$PROJECT_DESCRIPTIONS
+- $TAG: $DESC. Calendar: $CAL."
+done
+
+if [[ -z "$CASE_SQL" ]]; then
+  print -r -- "$(date -u +"%Y-%m-%d %H:%M:%S") no project in $CONFIG has any chats configured; nothing to check." >> "$ERR_LOG"
+  exit 0
+fi
+
+WHERE_SQL="${(j: OR :)WHERE_PARTS}"
+
+DIGEST="$(sqlite3 -separator '|' "$WHATSAPP_DB_PATH" "
+  SELECT
+    messages.timestamp,
+    CASE$CASE_SQL ELSE 'Unknown' END AS project,
+    chats.name,
+    messages.sender,
+    messages.content
+  FROM messages
+  JOIN chats ON messages.chat_jid = chats.jid
+  WHERE ($WHERE_SQL)
+    AND messages.is_from_me = 0
+    AND messages.timestamp > '$LAST_CHECK'
+    AND messages.content != ''
+  ORDER BY project, messages.timestamp ASC
+  LIMIT ${WHATSAPP_NOTIFIER_MAX_MESSAGES};
+" 2>>"$ERR_LOG")" || DIGEST=""
+
+if [[ -z "$DIGEST" ]]; then
+  print -r -- "$NOW" > "$STATE_FILE"
+  exit 0
+fi
+
+STATUS_EMAIL_TO="$(jq -r '.statusEmailTo // ""' "$CONFIG")"
+SLACK_CHANNEL_ID="$(jq -r '.slackChannelId // ""' "$CONFIG")"
+CROSS_POSTING_NOTES="$(jq -r '.crossPostingNotes // ""' "$CONFIG")"
+
+ALLOWED_TOOLS="mcp__claude_ai_Google_Calendar__list_events,mcp__claude_ai_Google_Calendar__search_events,mcp__claude_ai_Google_Calendar__create_event"
+EMAIL_SECTION=""
+if [[ -n "$STATUS_EMAIL_TO" ]]; then
+  ALLOWED_TOOLS="$ALLOWED_TOOLS,mcp__claude_ai_Gmail__send_message"
+  EMAIL_SECTION="
+4. If step 1 found anything calendar-worthy (whether or not a new event was created), send exactly one status email for this project via Gmail send_message:
+   - to: $STATUS_EMAIL_TO
+   - subject: [<project tag>] Status - $TODAY
+   - body: plain text, same language as the source messages, terse bullet list, no greeting or sign-off. State which calendar(s) were touched for each new item. Keep it as short as the messages allow.
+   This is a pre-approved status email to your own tracking inbox — send it directly, no draft, no approval needed. If nothing calendar-worthy was found for this project, do not send an email for it."
+fi
+
+SLACK_SECTION=""
+if [[ -n "$SLACK_CHANNEL_ID" ]]; then
+  ALLOWED_TOOLS="$ALLOWED_TOOLS,mcp__claude_ai_Slack__slack_send_message"
+  SLACK_SECTION="
+
+After handling every project, post exactly ONE combined message to Slack channel ID $SLACK_CHANNEL_ID via slack_send_message: a short, casual summary (a couple of lines, same language as the source messages) of what happened across all projects this run. Skip it only if truly nothing worth mentioning happened."
+fi
+
+CROSS_POSTING_SECTION=""
+if [[ -n "$CROSS_POSTING_NOTES" ]]; then
+  CROSS_POSTING_SECTION="
+
+Cross-posting rule for any event you create: $CROSS_POSTING_NOTES"
+fi
+
+NEVER_EMAIL_NOTE=""
+if [[ -n "$STATUS_EMAIL_TO" ]]; then
+  NEVER_EMAIL_NOTE=" Never email anyone other than $STATUS_EMAIL_TO."
+fi
+
+PROMPT="You are maintaining calendars (and optionally status emails / a Slack channel) from new WhatsApp activity. Act autonomously — do not ask questions, there is no one to answer them.
+
+New inbound WhatsApp messages since the last check, one per line, format: timestamp|project|chat name|sender|content:
+
+$DIGEST
+
+Project routing (already applied above as the project column):$PROJECT_DESCRIPTIONS
+- Unknown: should not normally appear; if it does, do not guess a calendar for it.$CROSS_POSTING_SECTION
+
+For EACH project present above with at least one message, do the following:
+
+1. Read its messages and identify concrete events, deadlines, or schedule changes: dates, times, activities, things to bring, pickup/dropoff changes, appointments, cancellations, etc. Ignore pure chit-chat with nothing schedule-worthy.
+2. For each one found, use Google Calendar search/list on the relevant date range in that project's calendar (and any other calendar a cross-posting rule above requires) to check whether a matching event already exists (same or very similar summary and time). Skip it if one already exists — never create a duplicate.
+3. Create any genuinely missing events with Google Calendar create_event, in the correct calendar(s). You may ONLY create events — you were not given tools to delete or update existing events, so do not attempt to.$EMAIL_SECTION$SLACK_SECTION
+
+Constraints: use only the tools you were given, nothing else. Never message any WhatsApp chat.$NEVER_EMAIL_NOTE When completely done, output exactly one short plain-text line (under 200 characters, no markdown) summarizing what you did, for a local log/notification — nothing else in your final response."
+
+SUMMARY="$("$WHATSAPP_NOTIFIER_CLAUDE_BIN" -p \
+  --allowedTools "$ALLOWED_TOOLS" \
+  --dangerously-skip-permissions \
+  --output-format text \
+  --no-session-persistence \
+  --model "$WHATSAPP_NOTIFIER_MODEL" \
+  "$PROMPT" 2>>"$ERR_LOG")" || SUMMARY=""
+
+if [[ -z "$SUMMARY" ]]; then
+  print -r -- "$(date -u +"%Y-%m-%d %H:%M:%S") claude invocation failed or returned nothing; will retry with the same messages next run." >> "$ERR_LOG"
+  exit 0
+fi
+
+notify "WhatsApp -> Calendar/Email/Slack" "$SUMMARY"
+print -r -- "$NOW" > "$STATE_FILE"

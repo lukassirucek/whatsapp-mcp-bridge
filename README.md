@@ -27,6 +27,8 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 - **Call History**: Capture incoming voice/video calls into a local SQLite table (live, 1:1 and group)
 - **Webhook Integration**: Forward incoming messages to external services
 - **Local Storage**: All messages stored locally in SQLite - only sent to Claude when you allow it
+- **Access Control**: Restrict the assistant to specific chats (`WHATSAPP_ALLOWED_CHATS`) and/or disable sending entirely (`WHATSAPP_DISABLE_SEND`)
+- **Optional Automation** (macOS): a background notifier for new messages, and an advanced assistant that can check a calendar, create missing events, and send status emails/Slack updates — see [Run automatically on macOS](#run-automatically-on-macos)
 
 ## Installation
 
@@ -39,6 +41,29 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 - FFmpeg (optional, for voice message conversion)
 
 ### Quick Start
+
+**macOS, one command:**
+
+```bash
+git clone https://github.com/verygoodplugins/whatsapp-mcp.git
+cd whatsapp-mcp
+scripts/install.sh
+```
+
+This checks prerequisites (offering to `brew install` anything missing),
+builds the Go bridge and installs it as a background service that survives
+reboots, and **streams its startup log inline so the QR code appears as part
+of this one command** — scan it with WhatsApp (Settings → Linked Devices →
+Link a Device) right there, no separate step needed. It then offers to add
+the MCP server entry to Claude Desktop's config for you (with a timestamped
+backup of your existing config first). Safe to re-run any time; an
+already-paired session reconnects on its own without a new QR code.
+
+By default the assistant can read and send in every chat. See
+[Restricting the assistant to specific chats](#restricting-the-assistant-to-specific-chats)
+to scope it down afterward, once you know which chats you want.
+
+Not on macOS, or prefer to do it by hand? Manual steps:
 
 1. **Clone the repository**
 
@@ -56,7 +81,9 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 
    On first start, the bridge prints and stores a local REST API token at
    `whatsapp-bridge/store/.bridge-token`. Scan the QR code with WhatsApp on
-   your phone to authenticate.
+   your phone to authenticate. (On macOS, `scripts/install-launchd-macos.sh`
+   runs this as a background service instead — see
+   [Run automatically on macOS](#run-automatically-on-macos).)
 
 3. **Configure Claude Desktop**
 
@@ -472,6 +499,8 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSAPP_DB_PATH`     | `../whatsapp-bridge/store/messages.db`   | Path to SQLite database                      |
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
+| `WHATSAPP_ALLOWED_CHATS` | unset (all chats visible)              | Comma-separated chat JIDs the MCP server is allowed to read. See [Restricting the assistant to specific chats](#restricting-the-assistant-to-specific-chats) |
+| `WHATSAPP_DISABLE_SEND`  | unset (sending allowed)                | Set to `true` to disable `send_message`/`send_file`/`send_audio_message`/`send_reaction`/`mark_messages_read` outright |
 | `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token for bridge REST calls; also signed onto outbound webhook POSTs |
 | `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox`     | Path-list of directories allowed for outbound media files |
 | `WHATSAPP_DEVICE_NAME` | `whatsmeow` (whatsmeow default)          | Label shown for this connection under WhatsApp > Linked Devices. Set to a recognisable name. Applies at pair time only (re-pair to change) |
@@ -502,6 +531,53 @@ recommended choice for remote connections; `sse` is kept for older clients.
 > authentication, and the underlying bridge can read and send WhatsApp messages
 > on your account. Only bind to a non-loopback address (e.g. `0.0.0.0`) if you
 > place an authenticating reverse proxy or tunnel in front of it.
+
+### Restricting the assistant to specific chats
+
+By default the MCP server can read every chat in your WhatsApp account. To
+scope a client (e.g. a Claude Desktop Project) down to a handful of group
+chats and contacts, set `WHATSAPP_ALLOWED_CHATS` to a comma-separated list of
+chat JIDs:
+
+```bash
+WHATSAPP_ALLOWED_CHATS=120363000000000000@g.us,12025551234@s.whatsapp.net
+```
+
+Find the JIDs with `list_chats` (or `search_contacts`) before setting the
+variable — group JIDs end in `@g.us`, direct chats in `@s.whatsapp.net`. Once
+set, every read tool — `list_chats`, `list_messages`, `get_chat`,
+`get_direct_chat_by_contact`, `get_contact_chats`, `get_last_interaction`,
+`get_message_context`, `search_contacts`, `download_media`, `view_media`, and
+`transcribe_audio` — only ever returns chats in the list; anything else is
+filtered out server-side, before it reaches the MCP client, regardless of what
+the assistant asks for. A chat outside the list is indistinguishable from one
+that doesn't exist.
+
+This is a read restriction only. Sending (`send_message`, `send_reaction`,
+`send_file`, `mark_messages_read`) is not restricted by it, and `get_contact`
+(a generic phone-number-to-name lookup) still resolves names outside the list,
+so the assistant can identify senders inside an allowed group chat.
+
+To disable sending entirely — independent of `WHATSAPP_ALLOWED_CHATS`, and
+without needing a second MCP server instance — set `WHATSAPP_DISABLE_SEND=true`.
+`send_message`, `send_file`, `send_audio_message`, `send_reaction`, and
+`mark_messages_read` all refuse before ever reaching the bridge:
+
+```bash
+WHATSAPP_DISABLE_SEND=true
+```
+
+If you need sending allowed for some chats but not others (rather than an
+all-or-nothing switch), run a second instance of the MCP server pointed at a
+different `WHATSAPP_ALLOWED_CHATS` and disable the tools you don't want that
+client to have from the host application's MCP settings (e.g. Claude
+Desktop's per-connector tool toggles).
+
+For per-client scoping (e.g. one Claude Desktop Project sees only a family
+group, another sees everything), set `WHATSAPP_ALLOWED_CHATS` in that client's
+own MCP server config entry rather than the shared `.env` — see the
+[Claude Desktop configuration](#quick-start) example above; add an `"env"`
+block alongside `"command"`/`"args"`.
 
 ### Bridge authentication and media paths
 
@@ -682,6 +758,11 @@ and token as above. This is separate from migrating an existing installation.
 
 ### Run automatically on macOS
 
+> `scripts/install.sh` (see [Quick Start](#quick-start)) already runs this
+> installer for you as part of first-time setup. Use this section directly if
+> you want to reinstall just the bridge, change its settings, or didn't use
+> `install.sh`.
+
 macOS users can install optional per-user `launchd` jobs that start the Go
 bridge at login and monitor it every 60 seconds for API health, disconnects, and
 QR relink signals. The installer does not require `sudo` and does not install or
@@ -741,6 +822,163 @@ scripts/uninstall-launchd-macos.sh
 Uninstall preserves `whatsapp-bridge/store/`, including WhatsApp session DBs,
 message DBs, media, and `.bridge-token`. Logs are left in
 `~/Library/Logs/whatsapp-mcp/` for manual cleanup.
+
+### Getting notified of new messages
+
+A separate, optional `launchd` job periodically checks `messages.db` for new
+inbound messages in [your allowed chats](#restricting-the-assistant-to-specific-chats)
+and — only when something new arrived — asks Claude Code (headless, local) to
+write a one-line summary and pushes it as a native macOS notification. It does
+not run any MCP server and cannot send WhatsApp messages; it only reads
+`messages.db` and the only side effect of the `claude` invocation itself is
+text output, captured by the script.
+
+Requires `claude` (Claude Code CLI) on `PATH` at install time and
+`WHATSAPP_ALLOWED_CHATS` set to a scope — the installer refuses to run without
+it, since an unattended job with no scope would summarize every chat in your
+account.
+
+```bash
+export WHATSAPP_ALLOWED_CHATS="120363000000000000@g.us,12025551234@s.whatsapp.net"
+scripts/install-message-notifier-launchd-macos.sh
+```
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WHATSAPP_ALLOWED_CHATS` | *(required)* | Chat JIDs to check, comma-separated |
+| `WHATSAPP_NOTIFIER_INTERVAL_SECONDS` | `1800` (30 min) | How often to check; minimum `60` |
+| `WHATSAPP_NOTIFIER_MAX_MESSAGES` | `50` | Cap on messages summarized per check |
+| `WHATSAPP_NOTIFIER_LOOKBACK_MINUTES` | `30` | How far back to look on the very first run only |
+| `WHATSAPP_NOTIFIER_MODEL` | `claude-haiku-4-5-20251001` | Model used for the summary (cheap by design — this runs unattended, repeatedly) |
+
+The `claude` invocation runs with `--restricted --permission-prompts none`, so
+it has no Bash/code-execution tools and cannot send messages, write files, or
+do anything besides produce the summary text this script then displays —
+sending WhatsApp messages remains entirely manual. If it fails (e.g. rate
+limited), the checkpoint is not advanced, so the same messages are retried on
+the next run rather than silently dropped.
+
+Notification delivery prefers `terminal-notifier` (installed separately, e.g.
+`brew install terminal-notifier`) over `osascript`, since `osascript`
+notifications triggered from a non-interactive `launchd` context are
+frequently swallowed silently by macOS depending on notification permissions.
+Either way, **macOS requires notification permission to be granted once**:
+run whichever tool is installed once by hand to trigger (or check) the
+permission prompt, and confirm it's enabled and set to show banners/alerts in
+System Settings → Notifications. A delivery failure (including a permission
+denial) is logged to `message-notifier.err.log`, not silently dropped.
+
+If banners never appear but the tool reports success (exit `0`, nothing in
+`message-notifier.err.log`), check **Do Not Disturb / Focus**: it silently
+delivers notifications to Notification Center without showing a banner or
+sound, which looks identical to "nothing happened." Disable it, or add an
+allowed-app/notification-type exception for this delivery.
+
+Logs: `~/Library/Logs/whatsapp-mcp/message-notifier.{out,err}.log`.
+Checkpoint: `~/Library/Application Support/whatsapp-mcp/state/last-message-check`.
+
+Uninstall with:
+
+```bash
+scripts/uninstall-message-notifier-launchd-macos.sh
+```
+
+### Calendar/email/Slack assistant (advanced, optional)
+
+A second, separate `launchd` job goes further than a notification: on the same
+polling cadence, it groups new WhatsApp messages into one or more "projects"
+you define (e.g. one per calendar/household bucket), and for each project with
+calendar-worthy news it asks Claude Code (headless, local) to:
+
+1. check that project's Google Calendar for a matching existing event,
+2. create any genuinely missing events (it is only ever given `create_event` —
+   never `delete_event`/`update_event`, so it cannot remove or rewrite
+   anything that already exists),
+3. optionally send a status email for that project, and
+4. optionally post one combined summary to a Slack channel.
+
+This is meaningfully more invasive than the plain notifier above — it can
+create calendar events and send real email/Slack messages unattended — so it
+is off by default and requires you to write your own config first.
+
+**Prerequisites:** `claude`, `sqlite3`, `jq` on `PATH`, and the Google
+Calendar / Gmail / Slack connectors from [claude.ai/customize/connectors](https://claude.ai/customize/connectors)
+connected to your account (only the ones you actually use — Gmail/Slack are
+each optional per-project, see below). These are account-level claude.ai
+connectors, the same ones available interactively; a local headless `claude`
+invocation reaches them the same way.
+
+**Setup:**
+
+```bash
+cp whatsapp-notifier-projects.example.json whatsapp-notifier-projects.json
+# edit whatsapp-notifier-projects.json: your own projects, calendars, chats
+scripts/install-calendar-assistant-launchd-macos.sh
+```
+
+`whatsapp-notifier-projects.json` (gitignored — this is personal data, never
+commit it) defines:
+
+```json
+{
+  "statusEmailTo": "",
+  "slackChannelId": "",
+  "crossPostingNotes": "",
+  "projects": [
+    {
+      "tag": "Family",
+      "calendarId": "your-calendar-id@group.calendar.google.com",
+      "description": "Household scheduling, kids' activities, appointments",
+      "chats": ["120363000000000000@g.us", "15551234567@s.whatsapp.net"]
+    }
+  ]
+}
+```
+
+- **`projects`** — one entry per calendar/bucket. `tag` becomes the email
+  subject tag (`[tag] Status - YYYYMMDD`) and the internal routing label. A
+  chat can only belong to one project; add as many project objects as you
+  need. Find chat JIDs with `list_chats` via the whatsapp MCP server.
+- **`statusEmailTo`** — optional. Leave empty to disable email entirely (no
+  Gmail tool is even granted in that case). When set, each project with
+  calendar-worthy news in a given run gets one status email, in a terse
+  bullet-list style with no greeting/sign-off, in the same language as the
+  source messages.
+- **`slackChannelId`** — optional. The channel **ID** (not `#name` — find it
+  via the Slack connector's `slack_search_channels`), not a URL. Leave empty
+  to disable Slack entirely. One combined summary is posted per run, covering
+  every project that had news.
+- **`crossPostingNotes`** — optional free text for any rule about creating one
+  event on more than one calendar (e.g. a shared-custody or shared-household
+  arrangement). Leave empty if you don't need this.
+
+Editing the config does **not** require reinstalling — it's read fresh on
+every run.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WHATSAPP_NOTIFIER_CONFIG` | `<repo>/whatsapp-notifier-projects.json` | Path to your config |
+| `WHATSAPP_NOTIFIER_INTERVAL_SECONDS` | `1800` (30 min) | How often to check; minimum `60` |
+| `WHATSAPP_NOTIFIER_MAX_MESSAGES` | `50` | Cap on messages processed per check |
+| `WHATSAPP_NOTIFIER_LOOKBACK_MINUTES` | `30` | How far back to look on the very first run only |
+| `WHATSAPP_NOTIFIER_MODEL` | `claude-sonnet-5` | Model used (more capable than the plain notifier's default — this does multi-step tool use and judgment calls, not just summarization) |
+
+Same failure handling as the plain notifier: if the `claude` invocation fails,
+the checkpoint is not advanced, so the same messages are retried next run
+instead of silently dropped. Local notification delivery (success or failure)
+uses the same `terminal-notifier`/`osascript` path — see the permission and
+Do Not Disturb notes above, which apply here too.
+
+Logs: `~/Library/Logs/whatsapp-mcp/calendar-assistant.{out,err}.log`.
+Checkpoint: `~/Library/Application Support/whatsapp-mcp/state/last-calendar-assistant-check`.
+
+Uninstall with:
+
+```bash
+scripts/uninstall-calendar-assistant-launchd-macos.sh
+```
+
+(This leaves `whatsapp-notifier-projects.json` in place.)
 
 ### CLI flags (Go bridge)
 
@@ -952,9 +1190,20 @@ sequenceDiagram
 ### Running Tests
 
 ```bash
+# Python (MCP server)
 cd whatsapp-mcp-server
 uv pip install -e ".[dev]"
 uv run pytest -v
+
+# Go (bridge)
+cd whatsapp-bridge
+go test ./...
+
+# macOS installer scripts (scripts/install*.sh), from the repo root
+zsh scripts/tests/test-launchd-macos.sh
+zsh scripts/tests/test-message-notifier-launchd-macos.sh
+zsh scripts/tests/test-calendar-assistant-launchd-macos.sh
+zsh scripts/tests/test-install-sh.sh
 ```
 
 ### Linting

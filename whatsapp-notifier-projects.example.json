@@ -1,0 +1,25 @@
+{
+  "_comment": "Copy this file to whatsapp-notifier-projects.json (gitignored) and fill in your own values. Used by scripts/install-calendar-assistant-launchd-macos.sh — see README for the full explanation of what this does and the tools/permissions it requires.",
+
+  "statusEmailTo": "",
+  "_statusEmailTo_comment": "Optional. If set, each project with calendar-worthy news gets one status email sent here, subject '[tag] Status - YYYYMMDD'. Leave empty to disable email entirely.",
+
+  "slackChannelId": "",
+  "_slackChannelId_comment": "Optional. Slack channel ID (not the #name) to post one combined summary to per run. Leave empty to disable Slack entirely.",
+
+  "crossPostingNotes": "",
+  "_crossPostingNotes_comment": "Optional free text describing any rule for when one event should be created on more than one calendar (e.g. shared custody, a shared household calendar plus a personal one). Leave empty if you don't need this.",
+
+  "projects": [
+    {
+      "tag": "Family",
+      "calendarId": "your-calendar-id@group.calendar.google.com",
+      "description": "Household scheduling, kids' activities, appointments mentioned in these chats",
+      "chats": [
+        "120363000000000000@g.us",
+        "15551234567@s.whatsapp.net"
+      ]
+    }
+  ],
+  "_projects_comment": "One entry per calendar/bucket. 'tag' becomes the email subject tag and the internal label the assistant uses to route each message — keep it short, no spaces needed but fine either way. 'chats' are WhatsApp JIDs (group JIDs end in @g.us, direct chats in @s.whatsapp.net) — find them with list_chats via the whatsapp MCP server. A chat can only belong to one project. Add as many project objects as you have calendars/buckets."
+}

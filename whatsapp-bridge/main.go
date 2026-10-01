@@ -3597,11 +3597,19 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// whatsmeow LID store (populated during live message handling).
 				var sender string
 				isFromMe := false
+				// Group messages with no recorded participant (WhatsApp's
+				// history-sync payload sometimes omits per-message attribution)
+				// must NOT fall back to the group's own JID: that misattributes
+				// the message to the group itself, which is indistinguishable
+				// from a real sender to every downstream consumer. Leave sender
+				// blank instead so it reads as genuinely unknown.
+				isGroupChat := jid.Server == types.GroupServer
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					var rawSender types.JID
+					haveSender := true
 					switch {
 					case isFromMe && client.Store.ID != nil:
 						rawSender = client.Store.ID.ToNonAD()
@@ -3611,15 +3619,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						} else {
 							rawSender = types.JID{User: *msg.Message.Key.Participant}
 						}
+					case isGroupChat:
+						haveSender = false
 					default:
+						// Direct chat, no participant field: the chat JID IS the other party.
 						rawSender = jid
 					}
-					var alt types.JID
-					if isFromMe && client.Store.ID != nil {
-						alt = client.Store.ID.ToNonAD()
+					if haveSender {
+						var alt types.JID
+						if isFromMe && client.Store.ID != nil {
+							alt = client.Store.ID.ToNonAD()
+						}
+						sender = resolveUserJID(client, rawSender, alt).User
 					}
-					sender = resolveUserJID(client, rawSender, alt).User
-				} else {
+				} else if !isGroupChat {
 					sender = jid.User
 				}
 

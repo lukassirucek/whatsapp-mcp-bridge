@@ -25,6 +25,54 @@ WHATSAPP_API_BASE_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api
 _BRIDGE_TOKEN_PATH = os.path.join(os.path.dirname(WHATSMEOW_DB_PATH), ".bridge-token")
 
 
+def _parse_allowed_chats(value: str | None) -> frozenset[str] | None:
+    """Parse WHATSAPP_ALLOWED_CHATS into a set of allowed chat JIDs.
+
+    Empty or unset means unrestricted — every chat is visible, the historical
+    default. When set, every read path (list_chats, list_messages, get_chat,
+    get_direct_chat_by_contact, get_contact_chats, get_last_interaction,
+    get_message_context, search_contacts, download_media) is filtered to only
+    these JIDs, so a chat outside the list is invisible regardless of query.
+    Sending is a separate, unrelated toggle — see WHATSAPP_DISABLE_SEND below.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    return frozenset(jid.strip() for jid in raw.split(",") if jid.strip())
+
+
+ALLOWED_CHATS = _parse_allowed_chats(os.getenv("WHATSAPP_ALLOWED_CHATS"))
+
+
+def is_chat_allowed(jid: str | None) -> bool:
+    """Whether `jid` may be read under WHATSAPP_ALLOWED_CHATS (True when unset)."""
+    return ALLOWED_CHATS is None or jid in ALLOWED_CHATS
+
+
+def _parse_bool_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Blocks send_message, send_file, send_audio_message, send_reaction, and
+# mark_messages_read outright — none of them reach the bridge when set. Unset
+# (the default) preserves the historical behavior: sending is unrestricted,
+# independent of WHATSAPP_ALLOWED_CHATS above.
+DISABLE_SEND = _parse_bool_env(os.getenv("WHATSAPP_DISABLE_SEND"))
+
+_SEND_DISABLED_MESSAGE = "Sending is disabled on this server (WHATSAPP_DISABLE_SEND is set)."
+
+
+def _allowlist_condition(column: str) -> tuple[str | None, list[str]]:
+    """SQL "<column> IN (...)" enforcing the allowlist, or (None, []) if unset.
+
+    Callers AND this into their WHERE clause alongside their own conditions.
+    """
+    if ALLOWED_CHATS is None:
+        return None, []
+    placeholders = ",".join("?" * len(ALLOWED_CHATS))
+    return f"{column} IN ({placeholders})", list(ALLOWED_CHATS)
+
+
 def _read_bridge_token() -> str | None:
     env = os.getenv("WHATSAPP_BRIDGE_TOKEN", "").strip()
     if env:
@@ -119,8 +167,10 @@ class MessageContext:
 
 def msg_to_dict(message: Message, include_sender_name: bool = True) -> dict[str, Any]:
     """Convert a Message dataclass to a dictionary for JSON serialization."""
-    # Extract phone number from JID (e.g., "1234567890@s.whatsapp.net" -> "1234567890")
-    sender_phone = message.sender.split("@")[0] if "@" in message.sender else message.sender
+    # Extract phone number from JID (e.g., "1234567890@s.whatsapp.net" -> "1234567890").
+    # An empty sender (history sync couldn't attribute a group message to any
+    # participant) has no phone number to extract — report None, not "".
+    sender_phone = (message.sender.split("@")[0] if "@" in message.sender else message.sender) or None
 
     sender_name = None
     sender_display = None
@@ -128,6 +178,12 @@ def msg_to_dict(message: Message, include_sender_name: bool = True) -> dict[str,
         if message.is_from_me:
             sender_name = "Me"
             sender_display = "Me"
+        elif not message.sender:
+            # Resolving an empty JID would be meaningless (or, without the
+            # guard in get_sender_name, dangerously wrong — see its docstring).
+            # Say plainly that the sender could not be determined.
+            sender_name = "Unknown"
+            sender_display = "Unknown (not recorded by WhatsApp history sync)"
         else:
             resolved_name = get_sender_name(message.sender)
             # Check if we got an actual name (not just the JID back)
@@ -141,7 +197,7 @@ def msg_to_dict(message: Message, include_sender_name: bool = True) -> dict[str,
     return {
         "id": message.id,
         "timestamp": message.timestamp.isoformat(),
-        "sender_jid": message.sender,
+        "sender_jid": message.sender or None,
         "sender_phone": sender_phone,
         "sender_name": sender_name,
         "sender_display": sender_display,  # "Name (phone)" or just phone if no name
@@ -316,6 +372,16 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
 
 
 def get_sender_name(sender_jid: str) -> str:
+    """Resolve a display name for `sender_jid`, or the JID itself if unresolvable.
+
+    Guards against an empty `sender_jid`: the fallback query below matches
+    `chats.jid LIKE '%<phone_part>%'`, and an empty phone_part becomes `'%%'`,
+    which matches every row and would return an arbitrary contact's name
+    instead of "no match". An empty JID can reach here for a history-sync
+    group message the bridge could not attribute to any participant.
+    """
+    if not sender_jid:
+        return sender_jid
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -487,6 +553,11 @@ def list_messages(
             where_clauses.append("(instr(LOWER(messages.content), LOWER(?)) > 0 OR instr(messages.content, ?) > 0)")
             params.extend([query, query])
 
+        allow_cond, allow_params = _allowlist_condition("chats.jid")
+        if allow_cond:
+            where_clauses.append(allow_cond)
+            params.extend(allow_params)
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
 
@@ -554,14 +625,16 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Mes
         cursor = conn.cursor()
 
         # Get the target message first
+        allow_cond, allow_params = _allowlist_condition("chats.jid")
+        target_where = "WHERE messages.id = ?" + (f" AND {allow_cond}" if allow_cond else "")
         cursor.execute(
-            """
+            f"""
             SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.quoted_message_id, messages.filename
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.id = ?
+            {target_where}
         """,
-            (message_id,),
+            (message_id, *allow_params),
         )
         msg_data = cursor.fetchone()
 
@@ -700,6 +773,11 @@ def list_chats(
             )
             params.extend([query, query, f"%{query}%"])
 
+        allow_cond, allow_params = _allowlist_condition("chats.jid")
+        if allow_cond:
+            where_clauses.append(allow_cond)
+            params.extend(allow_params)
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
 
@@ -754,17 +832,19 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
+        allow_cond, allow_params = _allowlist_condition("jid")
         cursor.execute(
-            """
+            f"""
             SELECT DISTINCT jid, name
             FROM chats
             WHERE
                 (instr(LOWER(name), LOWER(?)) > 0 OR instr(name, ?) > 0 OR jid LIKE ?)
                 AND jid NOT LIKE '%@g.us'
+                {f"AND {allow_cond}" if allow_cond else ""}
             ORDER BY name, jid
             LIMIT 50
         """,
-            (query, query, jid_pattern),
+            (query, query, jid_pattern, *allow_params),
         )
         for jid, name in cursor.fetchall():
             if jid not in seen_jids:
@@ -782,19 +862,23 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
         try:
             conn2 = sqlite3.connect(WHATSMEOW_DB_PATH)
             cursor2 = conn2.cursor()
+            allow_cond2, allow_params2 = _allowlist_condition("their_jid")
             cursor2.execute(
-                """
+                f"""
                 SELECT their_jid, full_name, push_name, first_name, business_name
                 FROM whatsmeow_contacts
                 WHERE
-                    instr(LOWER(full_name), LOWER(?)) > 0 OR instr(full_name, ?) > 0
-                    OR instr(LOWER(push_name), LOWER(?)) > 0 OR instr(push_name, ?) > 0
-                    OR instr(LOWER(first_name), LOWER(?)) > 0 OR instr(first_name, ?) > 0
-                    OR instr(LOWER(business_name), LOWER(?)) > 0 OR instr(business_name, ?) > 0
-                    OR their_jid LIKE ?
+                    (
+                        instr(LOWER(full_name), LOWER(?)) > 0 OR instr(full_name, ?) > 0
+                        OR instr(LOWER(push_name), LOWER(?)) > 0 OR instr(push_name, ?) > 0
+                        OR instr(LOWER(first_name), LOWER(?)) > 0 OR instr(first_name, ?) > 0
+                        OR instr(LOWER(business_name), LOWER(?)) > 0 OR instr(business_name, ?) > 0
+                        OR their_jid LIKE ?
+                    )
+                    {f"AND {allow_cond2}" if allow_cond2 else ""}
                 LIMIT 50
             """,
-                (query, query, query, query, query, query, query, query, jid_pattern),
+                (query, query, query, query, query, query, query, query, jid_pattern, *allow_params2),
             )
             for their_jid, full_name, push_name, first_name, business_name in cursor2.fetchall():
                 if their_jid not in seen_jids:
@@ -825,6 +909,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
 
         aliases = _sender_aliases(jid)
         placeholders = ",".join("?" * len(aliases))
+        allow_cond, allow_params = _allowlist_condition("c.jid")
         cursor.execute(
             f"""
             SELECT DISTINCT
@@ -837,16 +922,19 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 {_last_read_time_select(cursor, "c")}
             FROM chats c
             {_last_message_join("c", "last_msg")}
-            WHERE EXISTS (
-                SELECT 1
-                FROM messages contact_msg
-                WHERE contact_msg.chat_jid = c.jid
-                    AND contact_msg.sender IN ({placeholders})
-            ) OR c.jid = ?
+            WHERE (
+                EXISTS (
+                    SELECT 1
+                    FROM messages contact_msg
+                    WHERE contact_msg.chat_jid = c.jid
+                        AND contact_msg.sender IN ({placeholders})
+                ) OR c.jid = ?
+            )
+            {f"AND {allow_cond}" if allow_cond else ""}
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """,
-            (*aliases, jid, limit, page * limit),
+            (*aliases, jid, *allow_params, limit, page * limit),
         )
 
         chats = cursor.fetchall()
@@ -889,6 +977,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
 
         aliases = _sender_aliases(jid)
         placeholders = ",".join("?" * len(aliases))
+        allow_cond, allow_params = _allowlist_condition("c.jid")
         cursor.execute(
             f"""
             SELECT
@@ -902,11 +991,12 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender IN ({placeholders}) OR c.jid = ?
+            WHERE (m.sender IN ({placeholders}) OR c.jid = ?)
+            {f"AND {allow_cond}" if allow_cond else ""}
             ORDER BY m.timestamp DESC
             LIMIT 1
         """,
-            (*aliases, jid),
+            (*aliases, jid, *allow_params),
         )
 
         msg_data = cursor.fetchone()
@@ -941,6 +1031,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
     Returns:
         Chat dictionary or None if not found
     """
+    if not is_chat_allowed(chat_jid):
+        return None
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -996,6 +1088,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
+        allow_cond, allow_params = _allowlist_condition("c.jid")
         cursor.execute(
             f"""
             SELECT
@@ -1009,9 +1102,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             FROM chats c
             {_last_message_join("c", "m")}
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            {f"AND {allow_cond}" if allow_cond else ""}
             LIMIT 1
         """,
-            (f"%{sender_phone_number}%",),
+            (f"%{sender_phone_number}%", *allow_params),
         )
 
         chat_data = cursor.fetchone()
@@ -1046,6 +1140,8 @@ def send_message(
     quoted_content: str = "",
     mentions: list[str] | None = None,
 ) -> tuple[bool, str]:
+    if DISABLE_SEND:
+        return False, _SEND_DISABLED_MESSAGE
     try:
         # Validate input
         if not recipient:
@@ -1087,6 +1183,8 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> tuple[bool,
     passing both in one /api/send call produces a single attachment-with-caption
     message instead of two separate messages.
     """
+    if DISABLE_SEND:
+        return False, _SEND_DISABLED_MESSAGE
     try:
         # Validate input
         if not recipient:
@@ -1121,6 +1219,8 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> tuple[bool,
 
 
 def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
+    if DISABLE_SEND:
+        return False, _SEND_DISABLED_MESSAGE
     try:
         # Validate input
         if not recipient:
@@ -1189,6 +1289,8 @@ def send_reaction(
     Returns:
         Tuple of (success, status_message).
     """
+    if DISABLE_SEND:
+        return False, _SEND_DISABLED_MESSAGE
     try:
         if not recipient:
             return False, "Recipient must be provided"
@@ -1229,6 +1331,8 @@ def mark_messages_read(
     timestamp: str | None = None,
 ) -> tuple[bool, str]:
     """Mark selected messages as read through the WhatsApp bridge."""
+    if DISABLE_SEND:
+        return False, _SEND_DISABLED_MESSAGE
     try:
         normalized_ids = [message_id.strip() for message_id in message_ids]
         if not normalized_ids or any(not message_id for message_id in normalized_ids):
@@ -1276,6 +1380,9 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     Returns:
         The local file path if download was successful, None otherwise
     """
+    if not is_chat_allowed(chat_jid):
+        print(f"Chat {chat_jid} is outside WHATSAPP_ALLOWED_CHATS; refusing to download")
+        return None
     try:
         url = f"{WHATSAPP_API_BASE_URL}/download"
         payload = {"message_id": message_id, "chat_jid": chat_jid}

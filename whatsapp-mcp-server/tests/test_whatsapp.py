@@ -1,8 +1,12 @@
 """Tests for WhatsApp MCP server functions."""
 
+import sqlite3
 from datetime import datetime
 
-from whatsapp import Chat, Contact, Message, chat_to_dict, contact_to_dict, msg_to_dict
+import pytest
+
+import whatsapp
+from whatsapp import Chat, Contact, Message, chat_to_dict, contact_to_dict, get_sender_name, msg_to_dict
 
 
 class TestMessageConversion:
@@ -103,6 +107,27 @@ class TestMessageConversion:
         result = msg_to_dict(msg, include_sender_name=False)
 
         assert result["reaction_to_message_id"] is None
+
+    def test_msg_to_dict_blank_sender_reports_unknown_not_group_jid(self):
+        """A blank sender (history sync couldn't attribute a group message to
+        any participant) must render as an explicit "Unknown", never as an
+        empty phone number or a resolved name — see whatsapp-bridge's
+        handleHistorySync for why sender can be "" for inbound group messages."""
+        msg = Message(
+            id="hist-no-participant",
+            timestamp=datetime(2024, 1, 15, 10, 30, 0),
+            sender="",
+            content="who sent this?",
+            is_from_me=False,
+            chat_jid="120363000000000000@g.us",
+        )
+
+        result = msg_to_dict(msg, include_sender_name=True)
+
+        assert result["sender_jid"] is None
+        assert result["sender_phone"] is None
+        assert result["sender_name"] == "Unknown"
+        assert result["sender_display"] == "Unknown (not recorded by WhatsApp history sync)"
 
     def test_msg_to_dict_quoted_message_id_present(self):
         """Quoted-reply messages expose quoted_message_id."""
@@ -233,3 +258,32 @@ class TestContactConversion:
         result = contact_to_dict(contact)
 
         assert result["name"] is None
+
+
+class TestGetSenderNameEmptyGuard:
+    """get_sender_name("") must short-circuit, not fall through to the
+    `chats.jid LIKE '%<phone_part>%'` fallback query: an empty phone_part
+    becomes the pattern '%%', which matches every row in the table and would
+    return an arbitrary contact's name instead of "no match". A blank sender
+    reaches here for a history-sync group message the bridge could not
+    attribute to any participant (see whatsapp-bridge's handleHistorySync)."""
+
+    @pytest.fixture
+    def messages_db_with_a_contact(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "messages.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
+        conn.execute(
+            "INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+            ("1234567890@s.whatsapp.net", "Alice", "2024-01-15 10:30:00+00:00"),
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", str(db_path))
+        return db_path
+
+    def test_empty_sender_does_not_wildcard_match_an_unrelated_contact(self, messages_db_with_a_contact):
+        assert get_sender_name("") == ""
+
+    def test_nonempty_sender_still_resolves_normally(self, messages_db_with_a_contact):
+        assert get_sender_name("1234567890@s.whatsapp.net") == "Alice"

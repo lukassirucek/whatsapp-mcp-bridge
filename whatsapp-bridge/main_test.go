@@ -1083,6 +1083,102 @@ func TestHandleHistorySync_LIDParticipant_ResolvedViaStore(t *testing.T) {
 	}
 }
 
+// TestHandleHistorySync_GroupMessageWithoutParticipant_SenderLeftBlank covers
+// the bug where a group message whose history-sync payload omits
+// Key.Participant fell back to the group's own JID as the sender —
+// indistinguishable from a real participant to every downstream consumer.
+// The sender must be left blank (unknown) instead of misattributed.
+func TestHandleHistorySync_GroupMessageWithoutParticipant_SenderLeftBlank(t *testing.T) {
+	groupJID := types.JID{User: "120363000000000000", Server: types.GroupServer}
+
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	if err := ms.StoreChat(groupJID.String(), "Test Group", time.Now()); err != nil {
+		t.Fatalf("seed group chat: %v", err)
+	}
+
+	historySync := &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{
+				{
+					ID: proto.String(groupJID.String()),
+					Messages: []*waProto.HistorySyncMsg{
+						{
+							Message: &waProto.WebMessageInfo{
+								Key: &waCommon.MessageKey{
+									ID:     proto.String("hist-msg-no-participant"),
+									FromMe: proto.Bool(false),
+									// Participant deliberately omitted, as WhatsApp's
+									// history-sync payload sometimes does.
+								},
+								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+								Message: &waProto.Message{
+									Conversation: proto.String("who sent this?"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	handleHistorySync(client, ms, historySync, logger)
+
+	got := querySender(ms, groupJID.String())
+	if got != "" {
+		t.Errorf("group message with no participant: sender = %q, want blank (group JID user was %q)",
+			got, groupJID.User)
+	}
+}
+
+// TestHandleHistorySync_DirectChatWithoutParticipant_SenderIsChatJID is the
+// non-regression companion to the test above: a 1:1 chat never carries a
+// Participant field (there's only one other party), so the fallback to the
+// chat's own JID as sender is correct there and must be preserved.
+func TestHandleHistorySync_DirectChatWithoutParticipant_SenderIsChatJID(t *testing.T) {
+	otherParty := types.JID{User: "19998887777", Server: types.DefaultUserServer}
+
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	historySync := &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{
+				{
+					ID: proto.String(otherParty.String()),
+					Messages: []*waProto.HistorySyncMsg{
+						{
+							Message: &waProto.WebMessageInfo{
+								Key: &waCommon.MessageKey{
+									ID:     proto.String("hist-msg-direct"),
+									FromMe: proto.Bool(false),
+								},
+								MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+								Message: &waProto.Message{
+									Conversation: proto.String("hi"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	handleHistorySync(client, ms, historySync, logger)
+
+	got := querySender(ms, otherParty.String())
+	if got != otherParty.User {
+		t.Errorf("direct chat with no participant: sender = %q, want chat JID user %q", got, otherParty.User)
+	}
+}
+
 func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) {
 	ms := newTestMessageStore(t)
 	logger := testLogger()
